@@ -65,6 +65,9 @@ inline void dump() {
                  "features %.3f s  pre_encode %.3f s  encode %.3f s (build %.3f)  aos %.3f s\n",
                  (long long) a.windows, (double) a.nodes / a.windows, (double) a.elements / a.windows,
                  a.features_s, a.pre_encode_s, a.encode_s, a.encode_build_s, a.aos_s);
+    std::fprintf(stderr, "[diar-prof] per-window encode s:");
+    for (double w : a.window_s) std::fprintf(stderr, " %.3f", w);
+    std::fprintf(stderr, "   (first vs rest separates cold-weight/first-touch cost from per-frame work)\n");
     std::vector<std::pair<int, int64_t>> rows(a.op_nodes.begin(), a.op_nodes.end());
     std::sort(rows.begin(), rows.end(), [](auto& l, auto& r) { return l.second > r.second; });
     for (auto& r : rows) {
@@ -204,8 +207,11 @@ std::vector<float> Session::encode(
         throw std::runtime_error("Nemotron 3 diarization encoder graph failed");
     }
     if (prof) {
-        diar_prof::get().encode_s += std::chrono::duration<double>(
+        const double dt = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - t0).count();
+        diar_prof::get().encode_s += dt;
+        diar_prof::get().window_s.push_back(std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - t_before_compute).count());
     }
     std::vector<float> probabilities;
     core::read_tensor_f32_into(encoder_graph_->probabilities.tensor, probabilities);
