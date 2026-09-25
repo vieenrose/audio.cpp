@@ -9,6 +9,7 @@
 #include <map>
 #include <cstdio>
 #include <cstdlib>
+#include <sys/resource.h>
 #include <numeric>
 #include <stdexcept>
 #include <utility>
@@ -26,6 +27,8 @@ namespace diar_prof {
 struct acc {
     double features_s = 0, pre_encode_s = 0, encode_s = 0, aos_s = 0, encode_build_s = 0;
     std::vector<double> window_s;   // per-window encode time: is the cost fixed or per-frame?
+    std::vector<long> window_minflt;  // minor page faults per window: first touch of the compute arena
+    std::vector<int64_t> window_frames;  // packed frames per window, for a per-frame view
     int64_t windows = 0, nodes = 0, elements = 0;
     std::map<int, int64_t> op_nodes, op_elems;
     bool on = false;
@@ -68,7 +71,19 @@ inline void dump() {
                  a.features_s, a.pre_encode_s, a.encode_s, a.encode_build_s, a.aos_s);
     std::fprintf(stderr, "[diar-prof] per-window encode s:");
     for (double w : a.window_s) std::fprintf(stderr, " %.3f", w);
-    std::fprintf(stderr, "   (first vs rest separates cold-weight/first-touch cost from per-frame work)\n");
+    std::fprintf(stderr, "\n[diar-prof] per-window frames:");
+    for (int64_t f : a.window_frames) std::fprintf(stderr, " %lld", (long long) f);
+    std::fprintf(stderr, "  ms/frame:");
+    for (size_t i = 0; i < a.window_s.size(); ++i)
+        std::fprintf(stderr, " %.2f", a.window_s[i] * 1000.0 / (a.window_frames[i] ? a.window_frames[i] : 1));
+    std::fprintf(stderr, "\n[diar-prof] per-window minor faults:");
+    long prev = 0;
+    for (size_t i = 0; i < a.window_minflt.size(); ++i) {
+        std::fprintf(stderr, " %ld", a.window_minflt[i] - prev);
+        prev = a.window_minflt[i];
+    }
+    std::fprintf(stderr, "   (a first window that is much more expensive AND fault-heavy is first touch of the\n"
+                          "    compute arena, not arithmetic - arena bytes are the thing to shrink or prefault)\n");
     std::vector<std::pair<int, int64_t>> rows(a.op_nodes.begin(), a.op_nodes.end());
     std::sort(rows.begin(), rows.end(), [](auto& l, auto& r) { return l.second > r.second; });
     for (auto& r : rows) {
@@ -214,6 +229,10 @@ std::vector<float> Session::encode(
         diar_prof::get().encode_s += dt;
         diar_prof::get().window_s.push_back(std::chrono::duration<double>(
             std::chrono::steady_clock::now() - t_compute0).count());
+        rusage ru{};
+        getrusage(RUSAGE_SELF, &ru);
+        diar_prof::get().window_minflt.push_back(ru.ru_minflt);
+        diar_prof::get().window_frames.push_back(frames);
     }
     std::vector<float> probabilities;
     core::read_tensor_f32_into(encoder_graph_->probabilities.tensor, probabilities);
