@@ -739,13 +739,24 @@ public:
         try {
             data_begin_ = gguf_get_data_offset(gguf);
             const int64_t logical_names_key = gguf_find_key(gguf, "audiocpp.tensor_names");
+            const int64_t tensor_count = gguf_get_n_tensors(gguf);
+            // BUNDLE SUPPORT: the logical-name list may be a PREFIX of the file's tensors, not necessarily
+            // all of them. A merged GGUF (tools/merge_gguf.py) carries another model's tensors in the same
+            // file, and those are simply not ours - we address tensors by logical name, so unmapped entries
+            // are invisible to this source. The invariant that actually matters is preserved: the list may
+            // not claim MORE names than the file has tensors, which would make a lookup point past the end.
+            const int64_t logical_count = logical_names_key >= 0
+                ? static_cast<int64_t>(gguf_get_arr_n(gguf, logical_names_key))
+                : tensor_count;
             if (logical_names_key >= 0 &&
                 (gguf_get_kv_type(gguf, logical_names_key) != GGUF_TYPE_ARRAY ||
                  gguf_get_arr_type(gguf, logical_names_key) != GGUF_TYPE_STRING ||
-                 gguf_get_arr_n(gguf, logical_names_key) != static_cast<size_t>(gguf_get_n_tensors(gguf)))) {
+                 logical_count > tensor_count)) {
                 throw std::runtime_error("GGUF audiocpp.tensor_names metadata is invalid");
             }
-            const int64_t count = gguf_get_n_tensors(gguf);
+            const int64_t count = logical_names_key >= 0
+                ? std::min(tensor_count, logical_count)
+                : tensor_count;
             const int64_t ranks_key = gguf_find_key(gguf, "audiocpp.tensor_ranks");
             const int64_t shapes_key = gguf_find_key(gguf, "audiocpp.tensor_shapes");
             const bool has_exact_shapes = ranks_key >= 0 && shapes_key >= 0;

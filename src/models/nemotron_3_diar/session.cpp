@@ -5,7 +5,9 @@
 #include "engine/framework/runtime/spec_backed_model.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <numeric>
 #include <stdexcept>
 #include <utility>
@@ -509,7 +511,12 @@ runtime::StreamEvent Session::process_audio_chunk(const runtime::AudioChunk & ch
 runtime::TaskResult Session::finalize() {
     require_prepared("Nemotron 3 diarization finalize()");
     if (!stream_started_) throw std::runtime_error("Nemotron 3 diarization has no active stream");
+    // Diagnostic split of the drain, which shows up as unattributed "other" seconds in the composite loop
+    // (the per-piece timers only cover audiocpp_stream_push). Off unless AUDIOCPP_PROF is set.
+    const bool prof = std::getenv("AUDIOCPP_PROF") != nullptr;
+    const auto t0 = std::chrono::steady_clock::now();
     process_stream_windows(stream_scheduler_->finalize());
+    const auto t1 = std::chrono::steady_clock::now();
     const int64_t speakers = assets_->model_config.num_speakers;
     const int64_t expected_frames = (stream_samples_ + kOutputHopSamples - 1) / kOutputHopSamples;
     const int64_t frames = std::min<int64_t>(
@@ -518,6 +525,12 @@ runtime::TaskResult Session::finalize() {
     runtime::TaskResult result;
     result.speaker_turns = decode_turns(
         stream_probabilities_, frames, decode_config(stream_request_.options), true);
+    const auto t2 = std::chrono::steady_clock::now();
+    if (prof) {
+        std::fprintf(stderr, "[audiocpp-prof] finalize: final_window %.3f s  decode_turns %.3f s  (frames=%lld)\n",
+                     std::chrono::duration<double>(t1 - t0).count(),
+                     std::chrono::duration<double>(t2 - t1).count(), (long long)frames);
+    }
     stream_started_ = false;
     return result;
 }
