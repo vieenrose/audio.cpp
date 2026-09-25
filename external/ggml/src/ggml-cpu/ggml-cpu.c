@@ -2340,7 +2340,14 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_TRI:
         case GGML_OP_FILL:
             {
-                n_tasks = n_threads;
+                // Work-size threshold, in the spirit of the GGML_OP_SOFT_MAX case below. These ops were the
+                // only ones unconditionally split across every thread, so a small elementwise op pays a
+                // two-thread dispatch and a barrier to move half as many bytes each. Partitioning by row
+                // decides which core does which row and changes nothing else: same elements, same order,
+                // bit-identical output. (On the x-asr leg the same change measured 0% - that leg is
+                // matmul-bound with the elementwise chain already hidden underneath - but the diarizer's
+                // encoder is elementwise-heavy, which is why it is worth measuring here.)
+                n_tasks = ggml_nelements(node) >= 32768 ? n_threads : 1;
             } break;
         case GGML_OP_SUB:
         case GGML_OP_SQR:

@@ -39,10 +39,15 @@ static inline void vec_binary_op_non_contiguous(const int64_t n, const int64_t n
     constexpr auto src1_to_f32 = type_conversion_table<src1_t>::to_f32;
     constexpr auto f32_to_dst  = type_conversion_table<dst_t >::from_f32;
 
+    // Counter instead of i % ne10: ne10 is int64_t, so the modulo is a 64-bit integer division per element -
+    // on an A78 that costs more than the add it is indexing. The counter selects the identical element in the
+    // identical order, so this is bit-identical. (The Nemotron-3 diarizer's encoder is elementwise-heavy -
+    // ~76M ADD and ~41M MUL elements per window - so this path is hot here.)
+    int64_t i10 = 0;
     for (int i = 0; i < n; i++) {
-        int i10 = i % ne10;
         const src1_t * y_ptr = (const src1_t *)((const char *)y + i10*nb10);
         z[i] = f32_to_dst(op(src0_to_f32(x[i]), src1_to_f32(*y_ptr)));
+        if (++i10 == ne10) i10 = 0;
     }
 }
 
@@ -60,10 +65,14 @@ static inline void vec_binary_op_two_sided_broadcast(
     constexpr auto src1_to_f32 = type_conversion_table<src1_t>::to_f32;
     constexpr auto f32_to_dst  = type_conversion_table<dst_t >::from_f32;
 
+    // Two counters instead of two per-element 64-bit modulo divisions; same elements, same order.
+    int64_t i00 = 0, i10 = 0;
     for (int64_t i = 0; i < n; i++) {
-        const src0_t * x_ptr = (const src0_t *) (x + (i % ne00)*nb00);
-        const src1_t * y_ptr = (const src1_t *) (y + (i % ne10)*nb10);
+        const src0_t * x_ptr = (const src0_t *) (x + i00*nb00);
+        const src1_t * y_ptr = (const src1_t *) (y + i10*nb10);
         z[i] = f32_to_dst(op(src0_to_f32(*x_ptr), src1_to_f32(*y_ptr)));
+        if (++i00 == ne00) i00 = 0;
+        if (++i10 == ne10) i10 = 0;
     }
 }
 
