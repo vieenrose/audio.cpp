@@ -25,6 +25,7 @@ namespace diar_prof {
 
 struct acc {
     double features_s = 0, pre_encode_s = 0, encode_s = 0, aos_s = 0, encode_build_s = 0;
+    std::vector<double> window_s;   // per-window encode time: is the cost fixed or per-frame?
     int64_t windows = 0, nodes = 0, elements = 0;
     std::map<int, int64_t> op_nodes, op_elems;
     bool on = false;
@@ -202,6 +203,7 @@ std::vector<float> Session::encode(
         diar_prof::get().encode_build_s += std::chrono::duration<double>(
             std::chrono::steady_clock::now() - t0).count();
     }
+    const auto t_compute0 = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     if (core::compute_backend_graph(
             execution_context().backend(), encoder_graph_->graph, encoder_graph_->plan) != GGML_STATUS_SUCCESS) {
         throw std::runtime_error("Nemotron 3 diarization encoder graph failed");
@@ -211,7 +213,7 @@ std::vector<float> Session::encode(
             std::chrono::steady_clock::now() - t0).count();
         diar_prof::get().encode_s += dt;
         diar_prof::get().window_s.push_back(std::chrono::duration<double>(
-            std::chrono::steady_clock::now() - t_before_compute).count());
+            std::chrono::steady_clock::now() - t_compute0).count());
     }
     std::vector<float> probabilities;
     core::read_tensor_f32_into(encoder_graph_->probabilities.tensor, probabilities);
