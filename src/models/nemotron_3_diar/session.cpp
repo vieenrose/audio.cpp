@@ -147,11 +147,17 @@ void Session::process_window_batch(
         if (features.encoder_frames > capacity) {
             throw std::runtime_error("Nemotron 3 diarization streaming window exceeds graph capacity");
         }
-        features.stacked.resize(static_cast<size_t>(
-            capacity * assets_->model_config.encoder.subsampling_factor *
-            assets_->feature_config.num_mel_bins), 0.0F);
-        features.encoder_frames = capacity;
-        features.feature_frames = capacity * assets_->model_config.encoder.subsampling_factor;
+        // Do NOT pad the window up to the configured capacity. encode() takes the length as a graph
+        // dimension (ensure_encoder_graph rebuilds when it changes) and the encoder is already given an
+        // explicit attention_mask(valid_frames, frames), so the zero-padded tail contributed no
+        // information - it contributed encoder FLOPs. The drain window is the pathological case: a couple
+        // of seconds of audio at the end of a file was costing a full-capacity encoder pass, which is where
+        // this loop's unattributed "other" seconds came from. Steady-state windows are already at capacity
+        // (the engine only releases a window once chunk_len frames have accumulated), so this trims the
+        // start and the drain and leaves the steady state on the same graph shape.
+        if (features.encoder_frames <= 0) {
+            throw std::runtime_error("Nemotron 3 diarization streaming window is empty");
+        }
     }
     const auto chunk_embeddings = pre_encode(features);
     std::vector<int64_t> central_frames;
@@ -207,7 +213,11 @@ void Session::process_embedding_batch(
         if (packed_capacity > capacity) {
             throw std::runtime_error("Nemotron 3 diarization streaming state exceeds graph capacity");
         }
-        packed_capacity = capacity;
+        // packed_capacity stays at the real max(packed_lengths) instead of being forced up to the
+        // configured capacity. The rows are masked by packed_lengths in attention_mask() and the tail is
+        // zero-filled, so a shorter buffer is the same computation on fewer positions - and for the drain
+        // window that is most of the pass. Same reason as the window padding above: the padding was
+        // capacity-shaped work, not information.
     }
     std::vector<float> packed(
         rows * static_cast<size_t>(packed_capacity * hidden), 0.0F);
