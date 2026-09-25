@@ -31,6 +31,12 @@ struct acc {
     std::vector<int64_t> window_frames;  // packed frames per window, for a per-frame view
     int64_t windows = 0, nodes = 0, elements = 0;
     std::map<int, int64_t> op_nodes, op_elems;
+    // MUL_MAT shapes: the x-asr leg was measured at n = 3-24 columns, which is why it reaches single-digit
+    // percent of int8 peak whatever the kernel. The question for the diar leg is whether it is the same
+    // problem or the opposite one: its windows are 380-548 frames, so its GEMMs may already be fat. This is a
+    // structural count (nodes and elements per shape), not a timing, because this graph is planned and run on
+    // a bare ggml backend with no eval callback.
+    std::map<std::pair<int64_t, int64_t>, int64_t> mm_shape_nodes, mm_shape_elems;
     bool on = false;
 };
 
@@ -58,6 +64,10 @@ inline void note_graph(ggml_cgraph * gf) {
         a.elements += ne;
         a.op_nodes[(int) t->op] += 1;
         a.op_elems[(int) t->op] += ne;
+        if (t->op == GGML_OP_MUL_MAT) {
+            a.mm_shape_nodes[{t->ne[0], t->ne[1]}] += 1;
+            a.mm_shape_elems[{t->ne[0], t->ne[1]}] += ne;
+        }
     }
 }
 
@@ -84,6 +94,18 @@ inline void dump() {
     }
     std::fprintf(stderr, "   (a first window that is much more expensive AND fault-heavy is first touch of the\n"
                           "    compute arena, not arithmetic - arena bytes are the thing to shrink or prefault)\n");
+    if (!a.mm_shape_nodes.empty()) {
+        std::vector<std::pair<std::pair<int64_t, int64_t>, int64_t>> sh(a.mm_shape_nodes.begin(), a.mm_shape_nodes.end());
+        std::sort(sh.begin(), sh.end(), [](auto& l, auto& r) { return l.second > r.second; });
+        std::fprintf(stderr, "[diar-prof] MUL_MAT shapes (k x n, nodes/window, elems/window):\n");
+        for (size_t i = 0; i < sh.size() && i < 10; ++i) {
+            std::fprintf(stderr, "[diar-prof]   k=%-6lld n=%-6lld %8lld nodes  %12.0f elems\n",
+                         (long long) sh[i].first.first, (long long) sh[i].first.second,
+                         (long long)(sh[i].second / a.windows),
+                         (double) a.mm_shape_elems[sh[i].first] / a.windows);
+        }
+        std::fprintf(stderr, "[diar-prof]   (%zu distinct shapes)\n", sh.size());
+    }
     std::vector<std::pair<int, int64_t>> rows(a.op_nodes.begin(), a.op_nodes.end());
     std::sort(rows.begin(), rows.end(), [](auto& l, auto& r) { return l.second > r.second; });
     for (auto& r : rows) {
