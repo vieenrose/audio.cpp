@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <map>
 #include <cstdio>
 #include <cstdlib>
 #include <numeric>
@@ -13,6 +14,70 @@
 #include <utility>
 
 namespace engine::models::nemotron_3_diar {
+
+// Diagnostic phase accounting for the diar encoder, off unless AUDIOCPP_PROF is set. audiocpp computes a
+// PLANNED graph on a bare ggml backend (no ggml_backend_sched), so there is no eval-callback hook to borrow
+// the way the x-asr leg has one; what is measurable here without distorting the run is phase-level time plus
+// a structural op histogram. That is what a one-runtime port needs anyway: which phase the window's cost is
+// actually in (mel frontend, conv subsample, transformer encoder, AOS state update), and which ops dominate
+// the graph it would have to rebuild.
+namespace diar_prof {
+
+struct acc {
+    double features_s = 0, pre_encode_s = 0, encode_s = 0, aos_s = 0, encode_build_s = 0;
+    int64_t windows = 0, nodes = 0, elements = 0;
+    std::map<int, int64_t> op_nodes, op_elems;
+    bool on = false;
+};
+
+inline acc& get() {
+    static acc a;
+    return a;
+}
+
+inline bool on() {
+    acc& a = get();
+    if (!a.on) {
+        a.on = std::getenv("AUDIOCPP_PROF") != nullptr;
+    }
+    return a.on;
+}
+
+inline void note_graph(ggml_cgraph * gf) {
+    acc& a = get();
+    if (!a.on || gf == nullptr) return;
+    a.windows++;
+    for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
+        const ggml_tensor * t = ggml_graph_node(gf, i);
+        const int64_t ne = ggml_nelements(t);
+        a.nodes++;
+        a.elements += ne;
+        a.op_nodes[(int) t->op] += 1;
+        a.op_elems[(int) t->op] += ne;
+    }
+}
+
+inline void dump() {
+    acc& a = get();
+    if (!a.on || a.windows == 0) return;
+    std::fprintf(stderr,
+                 "[diar-prof] windows=%lld graph_nodes/window=%.0f elems/window=%.0f | "
+                 "features %.3f s  pre_encode %.3f s  encode %.3f s (build %.3f)  aos %.3f s\n",
+                 (long long) a.windows, (double) a.nodes / a.windows, (double) a.elements / a.windows,
+                 a.features_s, a.pre_encode_s, a.encode_s, a.encode_build_s, a.aos_s);
+    std::vector<std::pair<int, int64_t>> rows(a.op_nodes.begin(), a.op_nodes.end());
+    std::sort(rows.begin(), rows.end(), [](auto& l, auto& r) { return l.second > r.second; });
+    for (auto& r : rows) {
+        const char* n = ggml_op_name((ggml_op) r.first);
+        std::fprintf(stderr, "[diar-prof]   %-22s %7lld nodes/window  %10.0f elems/window\n",
+                     n ? n : "?", (long long)(r.second / a.windows), (double) a.op_elems[r.first] / a.windows);
+    }
+    a = acc();
+    a.on = true;
+}
+
+} // namespace diar_prof
+
 namespace {
 
 constexpr const char * kFamily = "nemotron_3_diar";
@@ -94,6 +159,8 @@ Session::DecodeConfig Session::decode_config(
 }
 
 std::vector<float> Session::pre_encode(const FeatureBatch & features) {
+    const bool prof_p = diar_prof::on();
+    const auto tp0 = prof_p ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     ensure_pre_encode_graph(
         pre_encode_graph_, execution_context(), *assets_, *weights_, graph_arena_bytes_,
         features.batch, features.encoder_frames);
@@ -105,6 +172,10 @@ std::vector<float> Session::pre_encode(const FeatureBatch & features) {
     }
     std::vector<float> embeddings;
     core::read_tensor_f32_into(pre_encode_graph_->output.tensor, embeddings);
+    if (prof_p) {
+        diar_prof::get().pre_encode_s += std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - tp0).count();
+    }
     return embeddings;
 }
 
@@ -113,6 +184,8 @@ std::vector<float> Session::encode(
     int64_t batch,
     int64_t frames,
     const std::vector<int64_t> & valid_frames) {
+    const bool prof = diar_prof::on();
+    const auto t0 = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     ensure_encoder_graph(
         encoder_graph_, execution_context(), *assets_, *weights_, graph_arena_bytes_,
         batch, frames);
@@ -121,9 +194,18 @@ std::vector<float> Session::encode(
         encoder_graph_->attention_mask,
         attention_mask(valid_frames, frames));
     core::set_backend_threads(execution_context().backend(), encoder_graph_->threads);
+    if (prof) {
+        diar_prof::note_graph(encoder_graph_->graph);
+        diar_prof::get().encode_build_s += std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - t0).count();
+    }
     if (core::compute_backend_graph(
             execution_context().backend(), encoder_graph_->graph, encoder_graph_->plan) != GGML_STATUS_SUCCESS) {
         throw std::runtime_error("Nemotron 3 diarization encoder graph failed");
+    }
+    if (prof) {
+        diar_prof::get().encode_s += std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - t0).count();
     }
     std::vector<float> probabilities;
     core::read_tensor_f32_into(encoder_graph_->probabilities.tensor, probabilities);
@@ -138,8 +220,14 @@ void Session::process_window_batch(
     if (windows.size() != states.size() || windows.size() != timelines.size()) {
         throw std::runtime_error("Nemotron 3 diarization streaming batch shape mismatch");
     }
+    const bool prof_w = diar_prof::on();
+    const auto tf0 = prof_w ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     auto features = compute_stream_features(
         windows, *assets_, execution_context().config().threads);
+    if (prof_w) {
+        diar_prof::get().features_s += std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - tf0).count();
+    }
     if (task_.mode == runtime::RunMode::Streaming) {
         if (windows.size() != 1) {
             throw std::runtime_error("Nemotron 3 diarization streaming requires a single graph row");
@@ -530,6 +618,10 @@ runtime::TaskResult Session::finalize() {
         std::fprintf(stderr, "[audiocpp-prof] finalize: final_window %.3f s  decode_turns %.3f s  (frames=%lld)\n",
                      std::chrono::duration<double>(t1 - t0).count(),
                      std::chrono::duration<double>(t2 - t1).count(), (long long)frames);
+    }
+    if (prof) {
+        diar_prof::get().aos_s += std::chrono::duration<double>(t2 - t1).count();
+        diar_prof::dump();
     }
     stream_started_ = false;
     return result;

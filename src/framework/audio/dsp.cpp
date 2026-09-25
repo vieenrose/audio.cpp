@@ -648,16 +648,50 @@ AudioTensor MelFilterbank::compute_custom(
     AudioTensor result;
     result.shape = {batch, n_mels, frames};
     result.values.assign(static_cast<size_t>(checked_product({batch, n_mels, frames})), 0.0f);
+
+    // Mel filterbanks are triangular: almost every weight is exactly zero. The dense loop spends a
+    // software-emulated 128-bit multiply-add on every one of them - and on ARM64 `long double` IS quad
+    // precision, so each is a libgcc call, not an FPU instruction. Measured on the phone with the
+    // Nemotron-3 diarizer's own bank: 504 nonzero weights out of 32,896 (1.5%, 2.0 bins per mel), and this
+    // loop was ~4.4 s of a 69 s clip - about 19% of the whole composite's wall time - computing sums that are
+    // 98.5% zeros.
+    //
+    // Skipping an exactly-zero weight is bit-identical rather than approximate: adding +0 to a finite partial
+    // sum is exact, the surviving terms accumulate in the same ascending-frequency order as before, and the
+    // only divergence possible is a sum that is exactly zero, where the result is -0.0 or +0.0 and both give
+    // the same log(x + 2^-24) downstream. The dense path is kept for banks that really are dense, so this
+    // cannot pessimise another model.
+    std::vector<std::vector<std::pair<int64_t, float>>> sparse(static_cast<size_t>(n_mels));
+    int64_t nonzero = 0;
+    for (int64_t m = 0; m < n_mels; ++m) {
+        for (int64_t f = 0; f < freq_bins; ++f) {
+            const float w = filterbank.values[static_cast<size_t>(m * freq_bins + f)];
+            if (w != 0.0f) {
+                sparse[static_cast<size_t>(m)].emplace_back(f, w);
+                ++nonzero;
+            }
+        }
+    }
+    const bool use_sparse = nonzero * 2 < n_mels * freq_bins;
 #ifdef _OPENMP
-    #pragma omp parallel for collapse(3) if(batch * n_mels * frames >= 4096)
+    #pragma omp parallel for collapse(2) if(batch * n_mels * frames >= 4096)
 #endif
     for (int64_t b = 0; b < batch; ++b) {
         for (int64_t m = 0; m < n_mels; ++m) {
+            const auto & terms = sparse[static_cast<size_t>(m)];
             for (int64_t t = 0; t < frames; ++t) {
                 long double sum = 0.0;
-                for (int64_t f = 0; f < freq_bins; ++f) {
-                    sum += static_cast<long double>(filterbank.values[static_cast<size_t>(m * freq_bins + f)]) *
-                           static_cast<long double>(power_spec[static_cast<size_t>(((b * freq_bins) + f) * frames + t)]);
+                if (use_sparse) {
+                    for (const auto & term : terms) {
+                        sum += static_cast<long double>(term.second) *
+                               static_cast<long double>(power_spec[static_cast<size_t>(
+                                   ((b * freq_bins) + term.first) * frames + t)]);
+                    }
+                } else {
+                    for (int64_t f = 0; f < freq_bins; ++f) {
+                        sum += static_cast<long double>(filterbank.values[static_cast<size_t>(m * freq_bins + f)]) *
+                               static_cast<long double>(power_spec[static_cast<size_t>(((b * freq_bins) + f) * frames + t)]);
+                    }
                 }
                 result.values[static_cast<size_t>(((b * n_mels) + m) * frames + t)] = static_cast<float>(sum);
             }
