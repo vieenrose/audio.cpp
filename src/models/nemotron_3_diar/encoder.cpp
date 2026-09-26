@@ -290,13 +290,19 @@ void ensure_encoder_graph(
     next->probabilities = modules::SigmoidModule().build(ctx, output);
     ggml_set_input(next->input.tensor);
     ggml_set_input(next->attention_mask.tensor);
-    // These tables are populated once and must survive every graph execution. attention_mask needs the same
-    // ggml_set_output pin as rope_cos/rope_sin - set_input alone does not stop gallocr from recycling its
-    // buffer once the last layer consumes it, so a later read (the layer0 dump, or a second window reusing
-    // the same persistent tensor) can return whatever node was allocated on top of it. Without this line the
-    // dumped mask was garbage (2301/152881 NaN, values up to +-65000, only 2739 real zeros) - not a real
-    // 0/-10000 validity mask at all - which is why every downstream layer0_port comparison saw NaN.
-    ggml_set_output(next->attention_mask.tensor);
+    // attention_mask needs the same ggml_set_output pin as rope_cos/rope_sin below - set_input alone does not
+    // stop gallocr from recycling its buffer once the last layer consumes it, so a later read (the layer0
+    // dump) can return whatever node got allocated on top of it. Without this the dumped mask was garbage
+    // (2301/152881 NaN, values up to +-65000, only 2739 real zeros) - not a real 0/-10000 validity mask at
+    // all - which is why every downstream layer0_port comparison saw NaN.
+    //
+    // Gated on dump_dir, unlike rope_cos/rope_sin: pinning this tensor measurably changes gallocr's layout
+    // for OTHER tensors and moved later-window speaker confidences in the 5th/6th decimal (turn boundaries
+    // and speaker labels unchanged) when tried unconditionally - a real production drift the byte-identity
+    // gate would catch. Since the mask is rewritten fresh before every window's compute() regardless of this
+    // flag, the corruption only ever mattered for the post-hoc debug read, so this fixes the oracle without
+    // touching the shipped path at all.
+    if (dump_dir != nullptr) ggml_set_output(next->attention_mask.tensor);
     ggml_set_input(next->rope_cos.tensor);
     ggml_set_input(next->rope_sin.tensor);
     ggml_set_output(next->rope_cos.tensor);
