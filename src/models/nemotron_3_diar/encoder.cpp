@@ -47,7 +47,6 @@ void trace_stage(const char * name, ggml_tensor * t) {
     if (layer_index != 1) return;
     v.push_back({ name, t });
 }
-}
 
 
 
