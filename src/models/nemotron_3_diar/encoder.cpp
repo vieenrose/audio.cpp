@@ -35,11 +35,18 @@ bool trace_layer0() {
 void trace_stage(const char * name, ggml_tensor * t) {
     if (!trace_layer0() || t == nullptr) return;
     auto & v = traced_stages_store();
-    // Layer 0 only. Without this every one of the 31 layers records the same stage names and the last layer
-    // overwrites the first - which is exactly what happened: 372 stages written, 12 files, layer 31's values.
-    // A new "01_norm1" means a new layer, so drop everything recorded for the previous one.
-    if (std::strcmp(name, "01_norm1") == 0) v.clear();
+    // Layer 0 ONLY, and this is the second correction to this trace. Clearing on "01_norm1" left the LAST
+    // layer in the store while the layer0_in/out dump holds layer 0 - so the port was being diffed against a
+    // different layer, and every stage "differed" by construction. Count layers explicitly and record only
+    // the first. The self-check that catches this class: corr(layer0_12_resid2, layer0_out) must be 1.0.
+    static int layer_index = 0;
+    if (std::strcmp(name, "01_norm1") == 0) {
+        layer_index++;
+        v.clear();
+    }
+    if (layer_index != 1) return;
     v.push_back({ name, t });
+}
 }
 
 
