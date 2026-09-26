@@ -290,7 +290,13 @@ void ensure_encoder_graph(
     next->probabilities = modules::SigmoidModule().build(ctx, output);
     ggml_set_input(next->input.tensor);
     ggml_set_input(next->attention_mask.tensor);
-    // These tables are populated once and must survive every graph execution.
+    // These tables are populated once and must survive every graph execution. attention_mask needs the same
+    // ggml_set_output pin as rope_cos/rope_sin - set_input alone does not stop gallocr from recycling its
+    // buffer once the last layer consumes it, so a later read (the layer0 dump, or a second window reusing
+    // the same persistent tensor) can return whatever node was allocated on top of it. Without this line the
+    // dumped mask was garbage (2301/152881 NaN, values up to +-65000, only 2739 real zeros) - not a real
+    // 0/-10000 validity mask at all - which is why every downstream layer0_port comparison saw NaN.
+    ggml_set_output(next->attention_mask.tensor);
     ggml_set_input(next->rope_cos.tensor);
     ggml_set_input(next->rope_sin.tensor);
     ggml_set_output(next->rope_cos.tensor);
