@@ -24,6 +24,11 @@ namespace {
 // variables with no eval-callback hook to observe, so a port can only be debugged by diffing the whole thing
 // and guessing. This records each stage by name when AUDIOCPP_TRACE_LAYER0 is set, and the session writes them
 // out after compute - turning "100% of the output differs" into "the first divergence is at stage X".
+int & trace_layer_index() {
+    static int v = 0;
+    return v;
+}
+
 std::vector<TracedStage> & traced_stages_store() {
     static std::vector<TracedStage> v;
     return v;
@@ -39,13 +44,20 @@ void trace_stage(const char * name, ggml_tensor * t) {
     // layer in the store while the layer0_in/out dump holds layer 0 - so the port was being diffed against a
     // different layer, and every stage "differed" by construction. Count layers explicitly and record only
     // the first. The self-check that catches this class: corr(layer0_12_resid2, layer0_out) must be 1.0.
-    static int layer_index = 0;
+    static int & layer_index = trace_layer_index();
     if (std::strcmp(name, "01_norm1") == 0) {
         layer_index++;
         v.clear();
     }
     if (layer_index != 1) return;
     v.push_back({ name, t });
+}
+
+// A second window rebuilds the graph, which re-runs the layer loop; without this reset layer_index would be
+// 2 by then and the trace would record nothing (observed: "0 traced stage(s) written").
+void reset_traced_layer() {
+    traced_stages_store().clear();
+    trace_layer_index() = 0;
 }
 
 
@@ -235,6 +247,7 @@ void ensure_encoder_graph(
         if (dump_dir != nullptr && index == 0) {
             next->dump_layer0 = true;
             next->layer0_in = output;
+            reset_traced_layer();
         }
         output = build_encoder_layer(
             ctx, output, next->attention_mask, next->rope_cos, next->rope_sin,
