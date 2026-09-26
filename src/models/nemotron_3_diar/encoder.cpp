@@ -1,6 +1,8 @@
 #include "engine/models/nemotron_3_diar/encoder.h"
 
 #include <cstdlib>
+#include <string>
+#include <vector>
 
 #include "engine/framework/core/backend.h"
 #include "engine/framework/debug/trace.h"
@@ -54,18 +56,42 @@ core::TensorValue build_attention(
     auto query = modules::SplitRoPEModule({head_dim}).build(ctx, make_heads(0), cos, sin);
     auto key = modules::SplitRoPEModule({head_dim}).build(ctx, make_heads(config.hidden_size), cos, sin);
     auto value = make_heads(2 * config.hidden_size);
+    trace_stage("02_qkv", qkv.tensor);
+    trace_stage("03_q", query.tensor);
+    trace_stage("04_k", key.tensor);
+    trace_stage("05_v", value.tensor);
     auto context = modules::GroupedQueryAttentionModule({
         head_dim,
         modules::GroupedQueryAttentionLowering::FlashGroupedViewKV,
         GGML_PREC_F32,
         modules::AttentionCausality::NonCausal,
     }).build(ctx, query, key, value, mask);
+    trace_stage("06_attn_raw", context.tensor);
     context = core::ensure_backend_addressable_layout(ctx, context);
     context = core::reshape_tensor(
         ctx, context,
         core::TensorShape::from_dims({input.shape.dims[0], input.shape.dims[1], config.hidden_size}));
-    return modules::LinearModule({config.hidden_size, config.hidden_size, true})
+    auto projected = modules::LinearModule({config.hidden_size, config.hidden_size, true})
         .build(ctx, context, {weights.attention.out_weight, weights.attention.out_bias});
+    trace_stage("07_oproj", projected.tensor);
+    return projected;
+}
+
+// Stage-by-stage trace of encoder layer 0, for the one-runtime port. audio.cpp's layer is a chain of local
+// variables with no eval-callback hook to observe, so a port can only be debugged by diffing the whole thing
+// and guessing. This records each stage by name when AUDIOCPP_TRACE_LAYER0 is set, and the session writes them
+// out after compute - turning "100% of the output differs" into "the first divergence is at stage X".
+const std::vector<TracedStage> & traced_layer_stages_impl() {
+    static std::vector<TracedStage> v;
+    return v;
+}
+bool trace_layer0() {
+    static const bool on = std::getenv("AUDIOCPP_TRACE_LAYER0") != nullptr;
+    return on;
+}
+void trace_stage(const char * name, ggml_tensor * t) {
+    if (!trace_layer0() || t == nullptr) return;
+    traced_layer_stages_impl().push_back({ name, t });
 }
 
 core::TensorValue build_encoder_layer(
@@ -78,16 +104,24 @@ core::TensorValue build_encoder_layer(
     const EncoderConfig & config) {
     auto normalized = modules::LayerNormModule({config.hidden_size, config.layer_norm_eps, true, true})
                           .build(ctx, input, weights.norm1);
+    trace_stage("01_norm1", normalized.tensor);
     auto output = modules::AddModule().build(
         ctx, input, build_attention(ctx, normalized, mask, cos, sin, weights, config));
+    trace_stage("08_resid1", output.tensor);
     normalized = modules::LayerNormModule({config.hidden_size, config.layer_norm_eps, true, true})
                      .build(ctx, output, weights.norm2);
     auto feed_forward = modules::LinearModule({config.hidden_size, config.intermediate_size, true})
                             .build(ctx, normalized, weights.ffn_in);
     feed_forward = modules::GeluModule({modules::GeluApproximation::ExactErf}).build(ctx, feed_forward);
+    trace_stage("09_ffn_in", feed_forward.tensor);
+    feed_forward = modules::GeluModule({modules::GeluApproximation::ExactErf}).build(ctx, feed_forward);
+    trace_stage("10_gelu", feed_forward.tensor);
     feed_forward = modules::LinearModule({config.intermediate_size, config.hidden_size, true})
                        .build(ctx, feed_forward, weights.ffn_out);
-    return modules::AddModule().build(ctx, output, feed_forward);
+    trace_stage("11_ffn_out", feed_forward.tensor);
+    auto layer_out = modules::AddModule().build(ctx, output, feed_forward);
+    trace_stage("12_resid2", layer_out.tensor);
+    return layer_out;
 }
 
 void allocate_graph(
@@ -236,6 +270,10 @@ void ensure_encoder_graph(
     ggml_set_output(next->probabilities.tensor);
     next->graph = ggml_new_graph_custom(next->ggml, kGraphNodes, false);
     ggml_build_forward_expand(next->graph, next->probabilities.tensor);
+    // Traced layer-0 stages must survive as graph outputs so the session can read them after compute.
+    for (const auto & stage : traced_layer_stages()) {
+        ggml_set_output(stage.tensor);
+    }
     if (next->dump_layer0) {
         // Now that the graph exists: keep layer 0's ends alive as outputs so the post-compute dump can read
         // them. They are already in the graph as dependencies of the final output, so this only pins them.

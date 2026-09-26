@@ -46,6 +46,14 @@ struct EncoderGraph {
     ~EncoderGraph();
 };
 
+// Named intermediate tensors of the traced encoder layer (AUDIOCPP_TRACE_LAYER0), for the one-runtime port.
+struct TracedStage {
+    std::string name;
+    ggml_tensor * tensor = nullptr;
+};
+const std::vector<TracedStage> & traced_layer_stages();
+void clear_traced_layer_stages();
+
 void ensure_pre_encode_graph(
     std::unique_ptr<PreEncodeGraph> & graph,
     const core::ExecutionContext & execution,

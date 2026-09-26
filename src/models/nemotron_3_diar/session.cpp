@@ -289,6 +289,24 @@ std::vector<float> Session::encode(
         dump_raw("_mask.f16", encoder_graph_->attention_mask.tensor);
         dump_raw("_rope_cos.f32", encoder_graph_->rope_cos.tensor);
         dump_raw("_rope_sin.f32", encoder_graph_->rope_sin.tensor);
+        for (const auto & stage : traced_layer_stages()) {
+            const size_t n = ggml_nbytes(stage.tensor);
+            std::vector<uint8_t> bytes(n);
+            ggml_backend_tensor_get(stage.tensor, bytes.data(), 0, n);
+            const std::string f = base + "_" + stage.name + ".bin";
+            std::FILE * sf = std::fopen(f.c_str(), "wb");
+            if (sf == nullptr) continue;
+            std::fwrite(bytes.data(), 1, n, sf);
+            std::fclose(sf);
+            std::FILE * nf = std::fopen((f + ".ne").c_str(), "wb");
+            if (nf != nullptr) {
+                for (int64_t d = 0; d < GGML_MAX_DIMS; ++d)
+                    std::fprintf(nf, "%lld%c", (long long) stage.tensor->ne[d], d + 1 == GGML_MAX_DIMS ? '\n' : ' ');
+                std::fclose(nf);
+            }
+        }
+        std::fprintf(stderr, "[diar-dump] %zu traced stage(s) written alongside -> %s\n",
+                     traced_layer_stages().size(), dir);
         std::fprintf(stderr, "[diar-dump] layer0 in %zu floats, out %zu floats (hidden=%lld frames=%lld) -> %s\n",
                      tin.size(), tout.size(), (long long) encoder_graph_->layer0_in.tensor->ne[0],
                      (long long) encoder_graph_->layer0_in.tensor->ne[1], dir);
