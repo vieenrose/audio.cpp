@@ -255,6 +255,34 @@ AUDIOCPP_API void            audiocpp_session_free(audiocpp_session * session);
 
 AUDIOCPP_API const char * audiocpp_session_family(const audiocpp_session * session);
 
+/* Nemotron 3 Diarization only (fails AUDIOCPP_ERR_INVALID_ARGUMENT on any other family's session).
+ *
+ * docs/one-runtime-merge.md: redirects JUST the encoder+head compute to a caller-supplied ggml runtime -
+ * e.g. one that shares a scheduler with another model already running in the same process - while every
+ * other piece of the family (the mel frontend, streaming window scheduling, the arrival-order speaker-cache
+ * state, turn decoding) keeps running this library's own code, unmodified.
+ *
+ * `fn` receives the SAME packed-embeddings-in/probabilities-out contract the family's own internal encode()
+ * uses: `embeddings` is `batch * frames * hidden` packed [speaker_cache | fifo | chunk] frames, row-major;
+ * `valid_frames` has `batch` entries, one valid length per row (<= frames; anything past it is masked
+ * padding, not meaningful audio). `fn` must set `*out_probabilities` to a buffer of exactly
+ * `batch * frames * num_speakers` floats ALLOCATED WITH malloc() (audio.cpp frees it after copying - the one
+ * ownership rule for this hook) and `*out_len` to that count, then return 0. A nonzero return (or a null
+ * `*out_probabilities`) fails the encode() call with AUDIOCPP_ERR_RUNTIME.
+ *
+ * Pass fn == NULL to remove a previously-set hook and restore the library's own compute.
+ */
+typedef int (*audiocpp_nemotron3_diar_encode_fn)(
+    void * user_data,
+    const float * embeddings, int64_t batch, int64_t frames, int64_t hidden,
+    const int64_t * valid_frames,
+    float ** out_probabilities, int64_t * out_len);
+
+AUDIOCPP_API audiocpp_status audiocpp_nemotron3_diar_set_external_encoder(
+    audiocpp_session * session,
+    audiocpp_nemotron3_diar_encode_fn fn,
+    void * user_data);
+
 /* Optional. audiocpp_session_run() and audiocpp_stream_start() always prepare
  * with the request they are about to run -- preparation carries the input
  * length, so a session prepared for one request must not run another. Call this

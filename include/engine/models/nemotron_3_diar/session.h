@@ -6,6 +6,7 @@
 #include "engine/framework/model_spec/metadata.h"
 #include "engine/framework/runtime/session_base.h"
 
+#include <functional>
 #include <memory>
 #include <set>
 #include <tuple>
@@ -27,6 +28,19 @@ public:
         std::shared_ptr<const Assets> assets,
         std::shared_ptr<const model_spec::ModelContract> contract);
     ~Session() override;
+
+    // docs/one-runtime-merge.md (nemo-x-asr-diarizer.cpp, the composite this family was built for): lets a
+    // caller redirect JUST the encoder+head compute - encode()'s own signature, packed
+    // [speaker_cache | fifo | chunk] embeddings in, per-frame speaker probabilities out - to a DIFFERENT ggml
+    // runtime that shares one scheduler with another model in the same process, while every other piece of
+    // this class (the mel frontend, streaming window scheduling, the arrival-order speaker-cache state, turn
+    // decoding) keeps running exactly this code, unmodified. Unset (the default) leaves encode() byte-for-
+    // byte the same as before this hook existed - checked by encode()'s own first line, nothing upstream of
+    // it changes at all.
+    using ExternalEncoder = std::function<std::vector<float>(
+        const std::vector<float> & embeddings, int64_t batch, int64_t frames,
+        const std::vector<int64_t> & valid_frames)>;
+    void set_external_encoder(ExternalEncoder fn) { external_encoder_ = std::move(fn); }
 
     std::string family() const override;
     runtime::VoiceTaskKind task_kind() const override;
@@ -97,6 +111,7 @@ private:
     bool stream_started_ = false;
     size_t graph_arena_bytes_ = 1024ull * 1024ull * 1024ull;
     size_t weight_context_bytes_ = 1024ull * 1024ull * 1024ull;
+    ExternalEncoder external_encoder_;
 };
 
 }  // namespace engine::models::nemotron_3_diar

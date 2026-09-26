@@ -20,9 +20,15 @@
 #include "engine/framework/runtime/model.h"
 #include "engine/framework/runtime/registry.h"
 #include "engine/framework/runtime/session.h"
+// One narrow, deliberate exception to "never a family-specific include" (see the file banner): the external-
+// encoder hook (docs/one-runtime-merge.md) is nemotron_3_diar-specific by nature - it redirects THAT
+// family's encoder+head compute to a caller-supplied ggml runtime while leaving everything else about the
+// family (mel frontend, streaming state, turn decoding) untouched. No other function in this file touches it.
+#include "engine/models/nemotron_3_diar/session.h"
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <exception>
 #include <filesystem>
 #include <iterator>
@@ -527,6 +533,51 @@ audiocpp_status audiocpp_session_create(const audiocpp_model * model,
 
 void audiocpp_session_free(audiocpp_session * session) {
     delete session;
+}
+
+audiocpp_status audiocpp_nemotron3_diar_set_external_encoder(
+    audiocpp_session * session,
+    audiocpp_nemotron3_diar_encode_fn fn,
+    void * user_data) {
+    if (session == nullptr) return fail(AUDIOCPP_ERR_INVALID_ARGUMENT, "session must be non-null");
+    if (session->family != "nemotron_3_diar") {
+        return fail(AUDIOCPP_ERR_INVALID_ARGUMENT,
+                    "audiocpp_nemotron3_diar_set_external_encoder requires a nemotron_3_diar session");
+    }
+    return guard([&] {
+        auto * diar = dynamic_cast<engine::models::nemotron_3_diar::Session *>(session->session.get());
+        if (diar == nullptr) {
+            throw std::runtime_error("nemotron_3_diar session did not downcast to its own Session type");
+        }
+        if (fn == nullptr) {
+            diar->set_external_encoder(nullptr);
+            return AUDIOCPP_OK;
+        }
+        // The callback allocates its return buffer with malloc(); this lambda copies it into the
+        // std::vector<float> encode() actually returns and frees the malloc'd buffer - the ONE ownership
+        // rule for this hook, documented on the typedef in audiocpp.h.
+        diar->set_external_encoder(
+            [fn, user_data](
+                const std::vector<float> & embeddings, int64_t batch, int64_t frames,
+                const std::vector<int64_t> & valid_frames) -> std::vector<float> {
+                float * out = nullptr;
+                int64_t out_len = 0;
+                const int64_t hidden =
+                    frames > 0 && batch > 0
+                        ? static_cast<int64_t>(embeddings.size()) / (batch * frames)
+                        : 0;
+                const int rc = fn(
+                    user_data, embeddings.data(), batch, frames, hidden,
+                    valid_frames.data(), &out, &out_len);
+                if (rc != 0 || out == nullptr) {
+                    throw std::runtime_error("nemotron_3_diar external encoder callback failed");
+                }
+                std::vector<float> result(out, out + out_len);
+                std::free(out);
+                return result;
+            });
+        return AUDIOCPP_OK;
+    });
 }
 
 const char * audiocpp_session_family(const audiocpp_session * session) {

@@ -225,6 +225,7 @@ std::vector<float> Session::encode(
     int64_t batch,
     int64_t frames,
     const std::vector<int64_t> & valid_frames) {
+    if (external_encoder_) return external_encoder_(embeddings, batch, frames, valid_frames);
     const bool prof = diar_prof::on();
     const auto t0 = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     ensure_encoder_graph(
