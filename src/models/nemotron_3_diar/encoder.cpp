@@ -19,6 +19,25 @@
 namespace engine::models::nemotron_3_diar {
 namespace {
 
+// Stage-by-stage trace of encoder layer 0, for the one-runtime port. audio.cpp's layer is a chain of local
+// variables with no eval-callback hook to observe, so a port can only be debugged by diffing the whole thing
+// and guessing. This records each stage by name when AUDIOCPP_TRACE_LAYER0 is set, and the session writes them
+// out after compute - turning "100% of the output differs" into "the first divergence is at stage X".
+std::vector<TracedStage> & traced_stages_store() {
+    static std::vector<TracedStage> v;
+    return v;
+}
+bool trace_layer0() {
+    static const bool on = std::getenv("AUDIOCPP_TRACE_LAYER0") != nullptr;
+    return on;
+}
+void trace_stage(const char * name, ggml_tensor * t) {
+    if (!trace_layer0() || t == nullptr) return;
+    traced_stages_store().push_back({ name, t });
+}
+
+
+
 constexpr size_t kGraphNodes = 1048576;
 
 void release_graph(
@@ -75,23 +94,6 @@ core::TensorValue build_attention(
         .build(ctx, context, {weights.attention.out_weight, weights.attention.out_bias});
     trace_stage("07_oproj", projected.tensor);
     return projected;
-}
-
-// Stage-by-stage trace of encoder layer 0, for the one-runtime port. audio.cpp's layer is a chain of local
-// variables with no eval-callback hook to observe, so a port can only be debugged by diffing the whole thing
-// and guessing. This records each stage by name when AUDIOCPP_TRACE_LAYER0 is set, and the session writes them
-// out after compute - turning "100% of the output differs" into "the first divergence is at stage X".
-const std::vector<TracedStage> & traced_layer_stages_impl() {
-    static std::vector<TracedStage> v;
-    return v;
-}
-bool trace_layer0() {
-    static const bool on = std::getenv("AUDIOCPP_TRACE_LAYER0") != nullptr;
-    return on;
-}
-void trace_stage(const char * name, ggml_tensor * t) {
-    if (!trace_layer0() || t == nullptr) return;
-    traced_layer_stages_impl().push_back({ name, t });
 }
 
 core::TensorValue build_encoder_layer(
@@ -326,5 +328,9 @@ std::vector<float> attention_mask(const std::vector<int64_t> & lengths, int64_t 
     }
     return values;
 }
+
+// Public accessors for the layer-0 trace, used by the session to write the stages after compute.
+const std::vector<TracedStage> & traced_layer_stages() { return traced_stages_store(); }
+void clear_traced_layer_stages() { traced_stages_store().clear(); }
 
 }  // namespace engine::models::nemotron_3_diar
