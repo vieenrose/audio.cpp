@@ -140,7 +140,6 @@ core::TensorValue build_encoder_layer(
                      .build(ctx, output, weights.norm2);
     auto feed_forward = modules::LinearModule({config.hidden_size, config.intermediate_size, true})
                             .build(ctx, normalized, weights.ffn_in);
-    feed_forward = modules::GeluModule({modules::GeluApproximation::ExactErf}).build(ctx, feed_forward);
     trace_stage("09_ffn_in", feed_forward.tensor);
     feed_forward = modules::GeluModule({modules::GeluApproximation::ExactErf}).build(ctx, feed_forward);
     trace_stage("10_gelu", feed_forward.tensor);
