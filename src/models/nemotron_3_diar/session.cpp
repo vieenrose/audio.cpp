@@ -268,11 +268,12 @@ std::vector<float> Session::encode(
         dump("_in.f32", tin, false);
         dump("_in.shape", tin, true);
         dump("_out.f32", tout, false);
+        // The whole encoder stack's real output - the acceptance test for a port of ALL layers, not just the
+        // one AUDIOCPP_DUMP_LAYER_INDEX selects above, and the head's real input (NOT `tout`, which is only
+        // the selected layer's output unless AUDIOCPP_DUMP_LAYER_INDEX happens to be the last layer).
+        std::vector<float> eout(ggml_nelements(encoder_graph_->encoder_out.tensor));
+        core::read_tensor_f32_into(encoder_graph_->encoder_out.tensor, eout);
         {
-            // The whole encoder stack's real output - the acceptance test for a port of ALL layers, not just
-            // the one AUDIOCPP_DUMP_LAYER_INDEX selects above.
-            std::vector<float> eout(ggml_nelements(encoder_graph_->encoder_out.tensor));
-            core::read_tensor_f32_into(encoder_graph_->encoder_out.tensor, eout);
             std::FILE * fh = std::fopen((std::string(dir) + "/encoder_out.f32").c_str(), "wb");
             if (fh != nullptr) { std::fwrite(eout.data(), sizeof(float), eout.size(), fh); std::fclose(fh); }
         }
@@ -367,6 +368,26 @@ std::vector<float> Session::encode(
             if (fh != nullptr) { std::fwrite(eout.data(), sizeof(float), eout.size(), fh); std::fclose(fh); }
             std::fprintf(stderr, "[diar-dump] isolated FULL encoder (%zu layers) written -> %s\n",
                          weights_->layers.size(), enc_dir);
+        }
+        {
+            // The head's real output - the acceptance test for porting it (probabilities is the whole
+            // graph's terminal node, nothing computed after it, so - like encoder_out/layer0_out - it is
+            // sound by construction regardless of AUDIOCPP_LAYER0_ISOLATED/AUDIOCPP_ENCODER_ISOLATED).
+            std::vector<float> probs(ggml_nelements(encoder_graph_->probabilities.tensor));
+            core::read_tensor_f32_into(encoder_graph_->probabilities.tensor, probs);
+            std::FILE * fh = std::fopen((std::string(dir) + "/probabilities.f32").c_str(), "wb");
+            if (fh != nullptr) { std::fwrite(probs.data(), sizeof(float), probs.size(), fh); std::fclose(fh); }
+        }
+        // Same idea as AUDIOCPP_ENCODER_ISOLATED but for the head: takes the ENCODER's real output directly
+        // (tout, already dumped above) and rebuilds only final_norm..sigmoid in an isolated graph. No
+        // aliasing risk to guard against here (this graph has 12 ops total, one of everything), but the same
+        // opt-in pattern keeps it consistent with the other two and costs nothing when unused.
+        if (const char * head_dir = std::getenv("AUDIOCPP_HEAD_ISOLATED"); head_dir != nullptr) {
+            auto probs = run_head_isolated(
+                execution_context().backend(), *weights_, assets_->model_config, eout, frames);
+            std::FILE * fh = std::fopen((std::string(head_dir) + "/iso_probabilities.f32").c_str(), "wb");
+            if (fh != nullptr) { std::fwrite(probs.data(), sizeof(float), probs.size(), fh); std::fclose(fh); }
+            std::fprintf(stderr, "[diar-dump] isolated head written -> %s\n", head_dir);
         }
     }
     if (prof) {

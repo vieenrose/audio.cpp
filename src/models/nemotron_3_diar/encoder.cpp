@@ -337,6 +337,80 @@ std::vector<float> run_encoder_isolated(
     return output;
 }
 
+std::vector<float> run_head_isolated(
+    ggml_backend_t backend,
+    const ModelWeights & weights,
+    const ModelConfig & config,
+    const std::vector<float> & encoder_output,
+    int64_t frames) {
+    const int64_t hidden = config.encoder.hidden_size;
+    if (static_cast<int64_t>(encoder_output.size()) != hidden * frames) {
+        throw std::runtime_error("run_head_isolated: encoder_output size does not match hidden*frames");
+    }
+    const size_t arena_bytes = ggml_tensor_overhead() * 128 + ggml_graph_overhead_custom(128, false);
+    ggml_context * ctx_mem = ggml_init({arena_bytes, nullptr, true});
+    if (ctx_mem == nullptr) throw std::runtime_error("run_head_isolated: ggml_init failed");
+    core::ModuleBuildContext ctx{ctx_mem, "nemotron_3_diar.head_isolated", core::BackendType::Cpu};
+
+    auto in_tv = core::make_tensor(ctx, GGML_TYPE_F32, core::TensorShape::from_dims({1, frames, hidden}));
+
+    // --- the head, exactly encoder.cpp's ensure_encoder_graph after the layer loop, unchanged -------------
+    auto output = modules::LayerNormModule({
+        config.encoder.hidden_size, config.encoder.layer_norm_eps, true, true,
+    }).build(ctx, in_tv, weights.final_norm);
+    output = modules::LinearModule({config.encoder.hidden_size, config.head.hidden_size, true})
+                 .build(ctx, output, weights.encoder_projection);
+    output = modules::TransposeModule({{0, 2, 1}, 3}).build(ctx, output);
+    output = modules::Conv1dModule({
+        config.head.hidden_size,
+        config.head.hidden_size * config.head.upsample_factor,
+        config.head.upsample_kernel_size,
+        1,
+        static_cast<int>(config.head.upsample_kernel_size / 2),
+        1,
+        true,
+    }).build(ctx, output, weights.subpixel_upsample);
+    output = modules::TransposeModule({{0, 2, 1}, 3}).build(ctx, output);
+    output = core::ensure_backend_addressable_layout(ctx, output);
+    output = core::reshape_tensor(
+        ctx, output,
+        core::TensorShape::from_dims({1, frames * config.head.upsample_factor, config.head.hidden_size}));
+    output = modules::ReluModule().build(ctx, output);
+    output = modules::LinearModule({config.head.hidden_size, config.head.hidden_size, true})
+                 .build(ctx, output, weights.head_hidden);
+    output = modules::ReluModule().build(ctx, output);
+    output = modules::LinearModule({config.head.hidden_size, config.num_speakers, true})
+                 .build(ctx, output, weights.speaker_head);
+    auto out_tv = modules::SigmoidModule().build(ctx, output);
+
+    ggml_set_input(in_tv.tensor);
+    ggml_set_output(out_tv.tensor);
+
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx_mem, 128, false);
+    ggml_build_forward_expand(graph, out_tv.tensor);
+    ggml_gallocr_t allocator = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    if (!ggml_gallocr_alloc_graph(allocator, graph)) {
+        ggml_gallocr_free(allocator);
+        ggml_free(ctx_mem);
+        throw std::runtime_error("run_head_isolated: failed to allocate graph");
+    }
+
+    core::write_tensor_f32(in_tv, encoder_output);
+
+    const auto status = ggml_backend_graph_compute(backend, graph);
+    if (status != GGML_STATUS_SUCCESS) {
+        ggml_gallocr_free(allocator);
+        ggml_free(ctx_mem);
+        throw std::runtime_error("run_head_isolated: graph compute failed");
+    }
+
+    std::vector<float> result(static_cast<size_t>(ggml_nelements(out_tv.tensor)));
+    core::read_tensor_f32_into(out_tv.tensor, result);
+    ggml_gallocr_free(allocator);
+    ggml_free(ctx_mem);
+    return result;
+}
+
 void ensure_pre_encode_graph(
     std::unique_ptr<PreEncodeGraph> & graph,
     const core::ExecutionContext & execution,

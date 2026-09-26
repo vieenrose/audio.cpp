@@ -103,6 +103,17 @@ std::vector<float> run_encoder_isolated(
     int64_t frames,
     int64_t valid_frames);
 
+// Same idea for the "head" that turns the encoder's output into per-frame speaker probabilities
+// (final_norm -> encoder_projection -> subpixel_upsample conv -> relu -> head_hidden -> relu -> speaker_head
+// -> sigmoid; encoder.cpp's build_encoder_graph, the lines after the layer loop). Takes the encoder's real
+// output directly (e.g. encoder_out.f32 / run_encoder_isolated's own return) rather than recomputing it.
+std::vector<float> run_head_isolated(
+    ggml_backend_t backend,
+    const ModelWeights & weights,
+    const ModelConfig & config,
+    const std::vector<float> & encoder_output,   // [hidden, frames], hidden fastest
+    int64_t frames);
+
 void ensure_pre_encode_graph(
     std::unique_ptr<PreEncodeGraph> & graph,
     const core::ExecutionContext & execution,
