@@ -42,6 +42,9 @@ struct EncoderGraph {
     // default path is unchanged and the check costs one getenv at graph-build time.
     core::TensorValue layer0_in;
     core::TensorValue layer0_out;
+    // The full encoder stack's real output (after all `weights.layers.size()` layers, before final_norm and
+    // the head) - the acceptance test for porting the WHOLE stack, not just one layer. Same dump_layer0 gate.
+    core::TensorValue encoder_out;
     bool dump_layer0 = false;
     ~EncoderGraph();
 };
@@ -87,6 +90,18 @@ Layer0IsolatedResult run_layer0_isolated(
     const std::vector<float> & input,   // [hidden, frames], hidden fastest - same layout as layer0_in.f32
     int64_t frames,
     int64_t valid_frames);              // <= frames; matches attention_mask()'s [valid_frames, frames) pad
+
+// Same idea, for the WHOLE encoder stack (all `weights.layers.size()` layers, chained in one graph) rather
+// than one layer - the acceptance test for porting the entire encoder, not just a single layer. Only the
+// final output is needed here (no per-layer stage tracing), so ownership can stay entirely inside the
+// function: everything is read back before it returns.
+std::vector<float> run_encoder_isolated(
+    ggml_backend_t backend,
+    const ModelWeights & weights,
+    const EncoderConfig & config,
+    const std::vector<float> & input,   // [hidden, frames], hidden fastest - same layout as encoder_in.f32
+    int64_t frames,
+    int64_t valid_frames);
 
 void ensure_pre_encode_graph(
     std::unique_ptr<PreEncodeGraph> & graph,

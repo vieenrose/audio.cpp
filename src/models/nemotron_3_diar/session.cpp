@@ -268,6 +268,14 @@ std::vector<float> Session::encode(
         dump("_in.f32", tin, false);
         dump("_in.shape", tin, true);
         dump("_out.f32", tout, false);
+        {
+            // The whole encoder stack's real output - the acceptance test for a port of ALL layers, not just
+            // the one AUDIOCPP_DUMP_LAYER_INDEX selects above.
+            std::vector<float> eout(ggml_nelements(encoder_graph_->encoder_out.tensor));
+            core::read_tensor_f32_into(encoder_graph_->encoder_out.tensor, eout);
+            std::FILE * fh = std::fopen((std::string(dir) + "/encoder_out.f32").c_str(), "wb");
+            if (fh != nullptr) { std::fwrite(eout.data(), sizeof(float), eout.size(), fh); std::fclose(fh); }
+        }
         // The layer's other three inputs are equally internal to audio.cpp - the validity mask and the two
         // RoPE tables - and a reproduction cannot be bit-exact without their exact contents. They are graph
         // INPUTS, so they are materialised in the backend buffer and can simply be read back.
@@ -347,6 +355,18 @@ std::vector<float> Session::encode(
                 dump_vec(("_" + stage.name + ".f32").c_str(), stage.tensor, v);
             }
             std::fprintf(stderr, "[diar-dump] %zu isolated stage(s) written -> %s\n", iso.stages.size(), iso_dir);
+        }
+        // Same idea as AUDIOCPP_LAYER0_ISOLATED but for the whole stack: rebuilds ALL `weights_->layers`,
+        // chained, in one isolated graph, using the same captured `tin` as the real encoder's own embed-norm
+        // output. Compare its result against encoder_out.f32 above as the acceptance test for a full port.
+        if (const char * enc_dir = std::getenv("AUDIOCPP_ENCODER_ISOLATED"); enc_dir != nullptr) {
+            auto eout = run_encoder_isolated(
+                execution_context().backend(), *weights_, assets_->model_config.encoder,
+                tin, frames, valid_frames.empty() ? frames : valid_frames[0]);
+            std::FILE * fh = std::fopen((std::string(enc_dir) + "/iso_encoder_out.f32").c_str(), "wb");
+            if (fh != nullptr) { std::fwrite(eout.data(), sizeof(float), eout.size(), fh); std::fclose(fh); }
+            std::fprintf(stderr, "[diar-dump] isolated FULL encoder (%zu layers) written -> %s\n",
+                         weights_->layers.size(), enc_dir);
         }
     }
     if (prof) {

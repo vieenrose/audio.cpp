@@ -266,6 +266,77 @@ Layer0IsolatedResult run_layer0_isolated(
     return result;
 }
 
+std::vector<float> run_encoder_isolated(
+    ggml_backend_t backend,
+    const ModelWeights & weights,
+    const EncoderConfig & config,
+    const std::vector<float> & input,
+    int64_t frames,
+    int64_t valid_frames) {
+    const int64_t hidden = config.hidden_size;
+    if (static_cast<int64_t>(input.size()) != hidden * frames) {
+        throw std::runtime_error("run_encoder_isolated: input size does not match hidden*frames");
+    }
+    const int64_t n_layers = static_cast<int64_t>(weights.layers.size());
+    // One tensor struct per op per layer (~60, per run_layer0_isolated's own measured usage) times n_layers,
+    // plus the four shared input tensors and the graph itself.
+    const size_t arena_bytes =
+        ggml_tensor_overhead() * (80 * static_cast<size_t>(n_layers) + 32) +
+        ggml_graph_overhead_custom(64 * static_cast<size_t>(n_layers) + 64, false);
+    ggml_context * ctx_mem = ggml_init({arena_bytes, nullptr, true});
+    if (ctx_mem == nullptr) throw std::runtime_error("run_encoder_isolated: ggml_init failed");
+    core::ModuleBuildContext ctx{ctx_mem, "nemotron_3_diar.encoder_isolated", core::BackendType::Cpu};
+
+    auto in_tv = core::make_tensor(ctx, GGML_TYPE_F32, core::TensorShape::from_dims({1, frames, hidden}));
+    auto mask_tv = core::make_tensor(ctx, GGML_TYPE_F16, core::TensorShape::from_dims({1, 1, frames, frames}));
+    const int64_t head_dim = hidden / config.heads;
+    auto cos_tv = core::make_tensor(
+        ctx, GGML_TYPE_F32, core::TensorShape::from_dims({1, config.heads, frames, head_dim / 2}));
+    auto sin_tv = core::make_tensor(
+        ctx, GGML_TYPE_F32, core::TensorShape::from_dims({1, config.heads, frames, head_dim / 2}));
+
+    auto stage_output = in_tv;
+    for (int64_t i = 0; i < n_layers; i++) {
+        stage_output = build_encoder_layer(ctx, stage_output, mask_tv, cos_tv, sin_tv, weights.layers[i], config);
+    }
+    auto out_tv = stage_output;
+
+    ggml_set_input(in_tv.tensor);
+    ggml_set_input(mask_tv.tensor);
+    ggml_set_input(cos_tv.tensor);
+    ggml_set_input(sin_tv.tensor);
+    ggml_set_output(out_tv.tensor);
+
+    ggml_cgraph * graph = ggml_new_graph_custom(ctx_mem, 64 * n_layers + 64, false);
+    ggml_build_forward_expand(graph, out_tv.tensor);
+    ggml_gallocr_t allocator = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    if (!ggml_gallocr_alloc_graph(allocator, graph)) {
+        ggml_gallocr_free(allocator);
+        ggml_free(ctx_mem);
+        throw std::runtime_error("run_encoder_isolated: failed to allocate graph");
+    }
+
+    core::write_tensor_f32(in_tv, input);
+    core::write_tensor_f16(mask_tv, attention_mask({valid_frames}, frames));
+    core::write_tensor_f32(cos_tv, rope_table(1, config.heads, frames, head_dim, config.rope_theta, true));
+    core::write_tensor_f32(sin_tv, rope_table(1, config.heads, frames, head_dim, config.rope_theta, false));
+
+    const auto status = ggml_backend_graph_compute(backend, graph);
+    if (status != GGML_STATUS_SUCCESS) {
+        ggml_gallocr_free(allocator);
+        ggml_free(ctx_mem);
+        throw std::runtime_error("run_encoder_isolated: graph compute failed");
+    }
+
+    std::vector<float> output(static_cast<size_t>(ggml_nelements(out_tv.tensor)));
+    core::read_tensor_f32_into(out_tv.tensor, output);
+    // Safe to free both now (unlike run_layer0_isolated): nothing outside this function reads any other
+    // tensor from this graph, only `output` above, already copied out.
+    ggml_gallocr_free(allocator);
+    ggml_free(ctx_mem);
+    return output;
+}
+
 void ensure_pre_encode_graph(
     std::unique_ptr<PreEncodeGraph> & graph,
     const core::ExecutionContext & execution,
@@ -361,6 +432,11 @@ void ensure_encoder_graph(
             next->layer0_out = output;
         }
     }
+    if (dump_dir != nullptr) {
+        // The whole encoder stack's real output - the acceptance test for porting all of it, not just the
+        // one layer layer0_in/layer0_out above cover. Pinned as a graph output alongside them below.
+        next->encoder_out = output;
+    }
     output = modules::LayerNormModule({
         config.encoder.hidden_size, config.encoder.layer_norm_eps, true, true,
     }).build(ctx, output, weights.final_norm);
@@ -421,6 +497,7 @@ void ensure_encoder_graph(
         // them. They are already in the graph as dependencies of the final output, so this only pins them.
         ggml_set_output(next->layer0_in.tensor);
         ggml_set_output(next->layer0_out.tensor);
+        ggml_set_output(next->encoder_out.tensor);
     }
     allocate_graph(execution, next->graph, next->allocator, next->plan);
     core::write_tensor_f32(
