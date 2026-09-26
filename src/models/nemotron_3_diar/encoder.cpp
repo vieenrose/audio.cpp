@@ -1,5 +1,7 @@
 #include "engine/models/nemotron_3_diar/encoder.h"
 
+#include <cstdlib>
+
 #include "engine/framework/core/backend.h"
 #include "engine/framework/debug/trace.h"
 #include "engine/framework/modules/activation_modules.h"
@@ -180,10 +182,22 @@ void ensure_encoder_graph(
     auto output = modules::LayerNormModule({
         config.encoder.hidden_size, config.encoder.layer_norm_eps, true, true,
     }).build(ctx, next->input, weights.embed_norm);
+    const char * dump_dir = std::getenv("AUDIOCPP_DUMP_LAYER0");
     for (size_t index = 0; index < weights.layers.size(); ++index) {
+        if (dump_dir != nullptr && index == 0) {
+            next->dump_layer0 = true;
+            next->layer0_in = output;
+        }
         output = build_encoder_layer(
             ctx, output, next->attention_mask, next->rope_cos, next->rope_sin,
             weights.layers[index], config.encoder);
+        if (dump_dir != nullptr && index == 0) {
+            next->layer0_out = output;
+            ggml_set_output(next->layer0_in.tensor);
+            ggml_set_output(next->layer0_out.tensor);
+            ggml_build_forward_expand(next->graph, next->layer0_in.tensor);
+            ggml_build_forward_expand(next->graph, next->layer0_out.tensor);
+        }
     }
     output = modules::LayerNormModule({
         config.encoder.hidden_size, config.encoder.layer_norm_eps, true, true,

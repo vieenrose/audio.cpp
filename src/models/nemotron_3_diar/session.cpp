@@ -245,6 +245,33 @@ std::vector<float> Session::encode(
             execution_context().backend(), encoder_graph_->graph, encoder_graph_->plan) != GGML_STATUS_SUCCESS) {
         throw std::runtime_error("Nemotron 3 diarization encoder graph failed");
     }
+    if (const char * dir = std::getenv("AUDIOCPP_DUMP_LAYER0"); dir != nullptr && encoder_graph_->dump_layer0) {
+        // Ground truth for the one-runtime port: audio.cpp's OWN layer 0, input and output, so a layer
+        // rebuilt in CrispASR's ggml can be diffed against it byte for byte. Raw F32 plus a .shape line
+        // with ggml's ne0 (hidden) and ne1 (frames), which is all a port needs to reproduce it.
+        const std::string base = std::string(dir) + "/layer0";
+        std::vector<float> tin(ggml_nelements(encoder_graph_->layer0_in.tensor));
+        core::read_tensor_f32_into(encoder_graph_->layer0_in.tensor, tin);
+        std::vector<float> tout(ggml_nelements(encoder_graph_->layer0_out.tensor));
+        core::read_tensor_f32_into(encoder_graph_->layer0_out.tensor, tout);
+        auto dump = [&](const char * suffix, const std::vector<float> & v, bool shape) {
+            std::FILE * fh = std::fopen((base + suffix).c_str(), "wb");
+            if (fh == nullptr) return;
+            if (shape) {
+                std::fprintf(fh, "%lld %lld\n", (long long) encoder_graph_->layer0_in.tensor->ne[0],
+                             (long long) encoder_graph_->layer0_in.tensor->ne[1]);
+            } else {
+                std::fwrite(v.data(), sizeof(float), v.size(), fh);
+            }
+            std::fclose(fh);
+        };
+        dump("_in.f32", tin, false);
+        dump("_in.shape", tin, true);
+        dump("_out.f32", tout, false);
+        std::fprintf(stderr, "[diar-dump] layer0 in %zu floats, out %zu floats (hidden=%lld frames=%lld) -> %s\n",
+                     tin.size(), tout.size(), (long long) encoder_graph_->layer0_in.tensor->ne[0],
+                     (long long) encoder_graph_->layer0_in.tensor->ne[1], dir);
+    }
     if (prof) {
         const double dt = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - t0).count();

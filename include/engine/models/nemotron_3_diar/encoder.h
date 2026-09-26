@@ -37,6 +37,12 @@ struct EncoderGraph {
     core::TensorValue rope_cos;
     core::TensorValue rope_sin;
     core::TensorValue probabilities;
+    // Ground-truth handles for the one-runtime port (docs/one-runtime-merge.md, stage 2). Layer 0's input
+    // and output are captured as graph outputs ONLY when AUDIOCPP_DUMP_LAYER0 names a directory, so the
+    // default path is unchanged and the check costs one getenv at graph-build time.
+    core::TensorValue layer0_in;
+    core::TensorValue layer0_out;
+    bool dump_layer0 = false;
     ~EncoderGraph();
 };
 
