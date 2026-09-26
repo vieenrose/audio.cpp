@@ -268,6 +268,27 @@ std::vector<float> Session::encode(
         dump("_in.f32", tin, false);
         dump("_in.shape", tin, true);
         dump("_out.f32", tout, false);
+        // The layer's other three inputs are equally internal to audio.cpp - the validity mask and the two
+        // RoPE tables - and a reproduction cannot be bit-exact without their exact contents. They are graph
+        // INPUTS, so they are materialised in the backend buffer and can simply be read back.
+        const auto dump_raw = [&](const char * suffix, const ggml_tensor * t) {
+            const size_t n = ggml_nbytes(t);
+            std::vector<uint8_t> bytes(n);
+            ggml_backend_tensor_get(t, bytes.data(), 0, n);
+            std::FILE * fh = std::fopen((base + suffix).c_str(), "wb");
+            if (fh == nullptr) return;
+            std::fwrite(bytes.data(), 1, n, fh);
+            std::fclose(fh);
+            std::FILE * sh = std::fopen((base + suffix + ".ne").c_str(), "wb");
+            if (sh != nullptr) {
+                for (int64_t d = 0; d < GGML_MAX_DIMS; ++d)
+                    std::fprintf(sh, "%lld%c", (long long) t->ne[d], d + 1 == GGML_MAX_DIMS ? '\n' : ' ');
+                std::fclose(sh);
+            }
+        };
+        dump_raw("_mask.f16", encoder_graph_->attention_mask.tensor);
+        dump_raw("_rope_cos.f32", encoder_graph_->rope_cos.tensor);
+        dump_raw("_rope_sin.f32", encoder_graph_->rope_sin.tensor);
         std::fprintf(stderr, "[diar-dump] layer0 in %zu floats, out %zu floats (hidden=%lld frames=%lld) -> %s\n",
                      tin.size(), tout.size(), (long long) encoder_graph_->layer0_in.tensor->ne[0],
                      (long long) encoder_graph_->layer0_in.tensor->ne[1], dir);
