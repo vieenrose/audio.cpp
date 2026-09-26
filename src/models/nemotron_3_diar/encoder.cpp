@@ -192,11 +192,9 @@ void ensure_encoder_graph(
             ctx, output, next->attention_mask, next->rope_cos, next->rope_sin,
             weights.layers[index], config.encoder);
         if (dump_dir != nullptr && index == 0) {
+            // Recorded here, EXPANDED below: next->graph does not exist until after this loop, so calling
+            // ggml_build_forward_expand from in here is a null dereference. (It was, and it segfaulted.)
             next->layer0_out = output;
-            ggml_set_output(next->layer0_in.tensor);
-            ggml_set_output(next->layer0_out.tensor);
-            ggml_build_forward_expand(next->graph, next->layer0_in.tensor);
-            ggml_build_forward_expand(next->graph, next->layer0_out.tensor);
         }
     }
     output = modules::LayerNormModule({
@@ -238,6 +236,12 @@ void ensure_encoder_graph(
     ggml_set_output(next->probabilities.tensor);
     next->graph = ggml_new_graph_custom(next->ggml, kGraphNodes, false);
     ggml_build_forward_expand(next->graph, next->probabilities.tensor);
+    if (next->dump_layer0) {
+        // Now that the graph exists: keep layer 0's ends alive as outputs so the post-compute dump can read
+        // them. They are already in the graph as dependencies of the final output, so this only pins them.
+        ggml_set_output(next->layer0_in.tensor);
+        ggml_set_output(next->layer0_out.tensor);
+    }
     allocate_graph(execution, next->graph, next->allocator, next->plan);
     core::write_tensor_f32(
         next->rope_cos,
