@@ -54,6 +54,40 @@ struct TracedStage {
 const std::vector<TracedStage> & traced_layer_stages();
 void clear_traced_layer_stages();
 
+// docs/one-runtime-merge.md SS12: the running 32-layer graph cannot be a sound oracle for its own
+// intermediates - ggml_set_output on a per-layer stage does not stop a LATER, structurally identical layer's
+// tensor from landing on the same gallocr slot (confirmed: 02_qkv, 05_v, 07_oproj and 11_ffn_out all read
+// back corrupted despite the flag). This builds ONLY encoder layer 0 as its own graph with nothing else that
+// could ever alias across LAYERS, which is enough to make the final output and most stages (01/03/04/06/08/10
+// - verified byte-identical to the production trace) sound. It is NOT a complete fix: 07_oproj and 11_ffn_out
+// still alias EACH OTHER within this single-layer graph (same bytes, ggml_set_output notwithstanding), and
+// 02_qkv/05_v/09_ffn_in read back plausible but as yet uncross-checked values - see SS12 for the open
+// question and use the true final output (`output` below) as the primary acceptance test. No production code
+// path calls this - it exists for the port comparison only.
+struct Layer0IsolatedResult {
+    std::vector<float> output;          // [hidden, frames] - the layer's true final output
+    std::vector<TracedStage> stages;    // named intermediates; valid until this result is destroyed
+    ggml_context * ggml = nullptr;      // owns the tensor structs above
+    ggml_gallocr_t allocator = nullptr; // owns the tensors' DATA - freeing it before `stages` is read back is
+                                        // a real bug this function's first draft had: read_tensor_f32_into
+                                        // silently returns zeros off a freed buffer, no error. Keep it alive
+                                        // until the caller is done, then let this destructor free it.
+    ~Layer0IsolatedResult();
+    Layer0IsolatedResult() = default;
+    Layer0IsolatedResult(Layer0IsolatedResult &&) noexcept;
+    Layer0IsolatedResult & operator=(Layer0IsolatedResult &&) noexcept;
+    Layer0IsolatedResult(const Layer0IsolatedResult &) = delete;
+    Layer0IsolatedResult & operator=(const Layer0IsolatedResult &) = delete;
+};
+
+Layer0IsolatedResult run_layer0_isolated(
+    ggml_backend_t backend,
+    const EncoderLayerWeights & weights,
+    const EncoderConfig & config,
+    const std::vector<float> & input,   // [hidden, frames], hidden fastest - same layout as layer0_in.f32
+    int64_t frames,
+    int64_t valid_frames);              // <= frames; matches attention_mask()'s [valid_frames, frames) pad
+
 void ensure_pre_encode_graph(
     std::unique_ptr<PreEncodeGraph> & graph,
     const core::ExecutionContext & execution,

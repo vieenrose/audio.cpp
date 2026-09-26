@@ -1,4 +1,5 @@
 #include "engine/models/nemotron_3_diar/encoder.h"
+#include "ggml-cpu.h"
 
 #include <cstdlib>
 #include <cstring>
@@ -171,6 +172,99 @@ void allocate_graph(
 
 PreEncodeGraph::~PreEncodeGraph() { release_graph(backend, ggml, graph, plan, allocator); }
 EncoderGraph::~EncoderGraph() { release_graph(backend, ggml, graph, plan, allocator); }
+
+Layer0IsolatedResult::~Layer0IsolatedResult() {
+    if (allocator != nullptr) ggml_gallocr_free(allocator);
+    if (ggml != nullptr) ggml_free(ggml);
+}
+Layer0IsolatedResult::Layer0IsolatedResult(Layer0IsolatedResult && other) noexcept
+    : output(std::move(other.output)), stages(std::move(other.stages)), ggml(other.ggml),
+      allocator(other.allocator) {
+    other.ggml = nullptr;
+    other.allocator = nullptr;
+}
+Layer0IsolatedResult & Layer0IsolatedResult::operator=(Layer0IsolatedResult && other) noexcept {
+    if (this != &other) {
+        if (allocator != nullptr) ggml_gallocr_free(allocator);
+        if (ggml != nullptr) ggml_free(ggml);
+        output = std::move(other.output);
+        stages = std::move(other.stages);
+        ggml = other.ggml;
+        allocator = other.allocator;
+        other.ggml = nullptr;
+        other.allocator = nullptr;
+    }
+    return *this;
+}
+
+Layer0IsolatedResult run_layer0_isolated(
+    ggml_backend_t backend,
+    const EncoderLayerWeights & weights,
+    const EncoderConfig & config,
+    const std::vector<float> & input,
+    int64_t frames,
+    int64_t valid_frames) {
+    Layer0IsolatedResult result;
+    const int64_t hidden = config.hidden_size;
+    if (static_cast<int64_t>(input.size()) != hidden * frames) {
+        throw std::runtime_error("run_layer0_isolated: input size does not match hidden*frames");
+    }
+    const size_t arena_bytes = ggml_tensor_overhead() * 512 + ggml_graph_overhead_custom(1024, false);
+    result.ggml = ggml_init({arena_bytes, nullptr, true});
+    if (result.ggml == nullptr) throw std::runtime_error("run_layer0_isolated: ggml_init failed");
+    core::ModuleBuildContext ctx{result.ggml, "nemotron_3_diar.layer0_isolated", core::BackendType::Cpu};
+
+    auto in_tv = core::make_tensor(ctx, GGML_TYPE_F32, core::TensorShape::from_dims({1, frames, hidden}));
+    auto mask_tv = core::make_tensor(ctx, GGML_TYPE_F16, core::TensorShape::from_dims({1, 1, frames, frames}));
+    const int64_t head_dim = hidden / config.heads;
+    auto cos_tv = core::make_tensor(
+        ctx, GGML_TYPE_F32, core::TensorShape::from_dims({1, config.heads, frames, head_dim / 2}));
+    auto sin_tv = core::make_tensor(
+        ctx, GGML_TYPE_F32, core::TensorShape::from_dims({1, config.heads, frames, head_dim / 2}));
+
+    // A fresh context with only this one layer in it: nothing else can ever be allocated on top of these
+    // tensors' memory, so marking them ggml_set_output below is - unlike in the full 32-layer graph - actually
+    // sufficient to make them sound.
+    reset_traced_layer();
+    auto out_tv = build_encoder_layer(ctx, in_tv, mask_tv, cos_tv, sin_tv, weights, config);
+
+    ggml_set_input(in_tv.tensor);
+    ggml_set_input(mask_tv.tensor);
+    ggml_set_input(cos_tv.tensor);
+    ggml_set_input(sin_tv.tensor);
+    ggml_set_output(out_tv.tensor);
+    for (const auto & stage : traced_layer_stages()) ggml_set_output(stage.tensor);
+
+    ggml_cgraph * graph = ggml_new_graph_custom(result.ggml, 1024, false);
+    ggml_build_forward_expand(graph, out_tv.tensor);
+    ggml_gallocr_t allocator = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+    if (!ggml_gallocr_alloc_graph(allocator, graph)) {
+        ggml_gallocr_free(allocator);
+        throw std::runtime_error("run_layer0_isolated: failed to allocate graph");
+    }
+
+    core::write_tensor_f32(in_tv, input);
+    core::write_tensor_f16(mask_tv, attention_mask({valid_frames}, frames));
+    core::write_tensor_f32(cos_tv, rope_table(1, config.heads, frames, head_dim, config.rope_theta, true));
+    core::write_tensor_f32(sin_tv, rope_table(1, config.heads, frames, head_dim, config.rope_theta, false));
+
+    const auto status = ggml_backend_graph_compute(backend, graph);
+    if (status != GGML_STATUS_SUCCESS) {
+        ggml_gallocr_free(allocator);
+        throw std::runtime_error("run_layer0_isolated: graph compute failed");
+    }
+
+    result.output.resize(static_cast<size_t>(ggml_nelements(out_tv.tensor)));
+    core::read_tensor_f32_into(out_tv.tensor, result.output);
+    result.stages = traced_layer_stages();
+    // Do NOT free the allocator here: it owns the DATA behind every tensor in `result.stages`, which the
+    // caller reads AFTER this function returns. An earlier draft freed it at this point and every stage read
+    // back as silent zeros - freeing releases the underlying buffer immediately (unlike ggml_gallocr_free
+    // called before a graph is even computed, which is safe - tools/layer0_port.cpp's own working pattern).
+    // Ownership transfers to `result`; ~Layer0IsolatedResult frees it once the caller is done.
+    result.allocator = allocator;
+    return result;
+}
 
 void ensure_pre_encode_graph(
     std::unique_ptr<PreEncodeGraph> & graph,

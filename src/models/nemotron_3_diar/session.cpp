@@ -310,6 +310,38 @@ std::vector<float> Session::encode(
         std::fprintf(stderr, "[diar-dump] layer0 in %zu floats, out %zu floats (hidden=%lld frames=%lld) -> %s\n",
                      tin.size(), tout.size(), (long long) encoder_graph_->layer0_in.tensor->ne[0],
                      (long long) encoder_graph_->layer0_in.tensor->ne[1], dir);
+        // docs/one-runtime-merge.md SS12: the stages just dumped above are read out of the running 32-layer
+        // graph and are not all sound (02_qkv/05_v/07_oproj/11_ffn_out read back corrupted despite
+        // ggml_set_output - a later layer's structurally identical tensor lands on the same gallocr slot).
+        // run_layer0_isolated rebuilds layer 0 alone, with the SAME real weights and the SAME captured
+        // input/valid_frames, in a graph with nothing else in it, so every stage it returns is a true graph
+        // output. Opt-in and independent of AUDIOCPP_DUMP_LAYER0's own correctness - this only needs `tin`,
+        // `frames`, and `valid_frames`, all already computed above for the existing dump.
+        if (const char * iso_dir = std::getenv("AUDIOCPP_LAYER0_ISOLATED"); iso_dir != nullptr) {
+            auto iso = run_layer0_isolated(
+                execution_context().backend(), weights_->layers[0], assets_->model_config.encoder,
+                tin, frames, valid_frames.empty() ? frames : valid_frames[0]);
+            const std::string ibase = std::string(iso_dir) + "/iso";
+            auto dump_vec = [&](const char * suffix, const ggml_tensor * shape_src, const std::vector<float> & v) {
+                std::FILE * fh = std::fopen((ibase + suffix).c_str(), "wb");
+                if (fh == nullptr) return;
+                std::fwrite(v.data(), sizeof(float), v.size(), fh);
+                std::fclose(fh);
+                if (shape_src == nullptr) return;
+                std::FILE * nh = std::fopen((ibase + suffix + ".ne").c_str(), "wb");
+                if (nh == nullptr) return;
+                for (int64_t d = 0; d < GGML_MAX_DIMS; ++d)
+                    std::fprintf(nh, "%lld%c", (long long) shape_src->ne[d], d + 1 == GGML_MAX_DIMS ? '\n' : ' ');
+                std::fclose(nh);
+            };
+            dump_vec("_out.f32", nullptr, iso.output);
+            for (const auto & stage : iso.stages) {
+                std::vector<float> v(static_cast<size_t>(ggml_nelements(stage.tensor)));
+                core::read_tensor_f32_into(stage.tensor, v);
+                dump_vec(("_" + stage.name + ".f32").c_str(), stage.tensor, v);
+            }
+            std::fprintf(stderr, "[diar-dump] %zu isolated stage(s) written -> %s\n", iso.stages.size(), iso_dir);
+        }
     }
     if (prof) {
         const double dt = std::chrono::duration<double>(
