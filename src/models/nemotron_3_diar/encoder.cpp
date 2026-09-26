@@ -47,7 +47,9 @@ void trace_stage(const char * name, ggml_tensor * t) {
     static int & layer_index = trace_layer_index();
     if (std::strcmp(name, "01_norm1") == 0) {
         layer_index++;
-        v.clear();
+        // Clear only when we are ABOUT to record. Clearing unconditionally left the store empty: layer 30
+        // wiped layer 0's stages on its way past, and the dump reported "0 traced stage(s) written".
+        if (layer_index == 1) v.clear();
     }
     if (layer_index != 1) return;
     v.push_back({ name, t });
