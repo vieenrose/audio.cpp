@@ -338,8 +338,16 @@ void ensure_encoder_graph(
         config.encoder.hidden_size, config.encoder.layer_norm_eps, true, true,
     }).build(ctx, next->input, weights.embed_norm);
     const char * dump_dir = std::getenv("AUDIOCPP_DUMP_LAYER0");
+    // Which layer to dump/trace: defaults to 0 (the original, hardcoded behaviour). The op sequence is
+    // layer-index-independent (build_encoder_layer takes no layer number, only weights), so once layer 0
+    // ports byte-exact the remaining risk is empirical, not structural - this lets that be checked against a
+    // DIFFERENT layer's real weights without looping the whole 32-layer stack in the port.
+    const size_t target_layer = [] {
+        const char * s = std::getenv("AUDIOCPP_DUMP_LAYER_INDEX");
+        return s != nullptr ? static_cast<size_t>(std::max(0, atoi(s))) : size_t{0};
+    }();
     for (size_t index = 0; index < weights.layers.size(); ++index) {
-        if (dump_dir != nullptr && index == 0) {
+        if (dump_dir != nullptr && index == target_layer) {
             next->dump_layer0 = true;
             next->layer0_in = output;
             reset_traced_layer();
@@ -347,7 +355,7 @@ void ensure_encoder_graph(
         output = build_encoder_layer(
             ctx, output, next->attention_mask, next->rope_cos, next->rope_sin,
             weights.layers[index], config.encoder);
-        if (dump_dir != nullptr && index == 0) {
+        if (dump_dir != nullptr && index == target_layer) {
             // Recorded here, EXPANDED below: next->graph does not exist until after this loop, so calling
             // ggml_build_forward_expand from in here is a null dereference. (It was, and it segfaulted.)
             next->layer0_out = output;

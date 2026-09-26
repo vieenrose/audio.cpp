@@ -318,8 +318,14 @@ std::vector<float> Session::encode(
         // output. Opt-in and independent of AUDIOCPP_DUMP_LAYER0's own correctness - this only needs `tin`,
         // `frames`, and `valid_frames`, all already computed above for the existing dump.
         if (const char * iso_dir = std::getenv("AUDIOCPP_LAYER0_ISOLATED"); iso_dir != nullptr) {
+            // Same AUDIOCPP_DUMP_LAYER_INDEX as the dump above selects which layer's weights `tin`/`tout`
+            // actually belong to - default 0, matching the original hardcoded behaviour.
+            const size_t target_layer = [] {
+                const char * s = std::getenv("AUDIOCPP_DUMP_LAYER_INDEX");
+                return s != nullptr ? static_cast<size_t>(std::max(0, atoi(s))) : size_t{0};
+            }();
             auto iso = run_layer0_isolated(
-                execution_context().backend(), weights_->layers[0], assets_->model_config.encoder,
+                execution_context().backend(), weights_->layers[target_layer], assets_->model_config.encoder,
                 tin, frames, valid_frames.empty() ? frames : valid_frames[0]);
             const std::string ibase = std::string(iso_dir) + "/iso";
             auto dump_vec = [&](const char * suffix, const ggml_tensor * shape_src, const std::vector<float> & v) {
