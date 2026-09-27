@@ -110,6 +110,7 @@ std::shared_ptr<ModelWeights> load_weights(
     ggml_backend_t backend,
     core::BackendType backend_type,
     assets::TensorStorageType storage_type,
-    size_t context_bytes);
+    size_t context_bytes,
+    bool pre_encode_only = false);
 
 }  // namespace engine::models::nemotron_3_diar

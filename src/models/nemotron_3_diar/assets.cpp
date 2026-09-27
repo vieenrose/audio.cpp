@@ -88,7 +88,8 @@ std::shared_ptr<ModelWeights> load_weights(
     ggml_backend_t backend,
     core::BackendType backend_type,
     assets::TensorStorageType storage_type,
-    size_t context_bytes) {
+    size_t context_bytes,
+    bool pre_encode_only) {
     const auto & source = *assets.model_weights;
     const auto & config = assets.model_config;
     auto result = std::make_shared<ModelWeights>();
@@ -100,6 +101,12 @@ std::shared_ptr<ModelWeights> load_weights(
     const auto stacked = config.encoder.feature_size * config.encoder.subsampling_factor;
     result->pre_encode = modules::binding::linear_from_source(
         store, source, "encoder.pre_encode.proj", storage_type, hidden, stacked, false);
+    if (pre_encode_only) {
+        // external_encoder session option: encode() (embed_norm, every layer, the head) runs elsewhere, so
+        // only the pre-encode projection - which this session still runs itself - needs uploading.
+        store.upload();
+        return result;
+    }
     result->embed_norm = modules::binding::norm_from_source(store, source, "encoder.embed_norm", hidden);
     result->layers.reserve(static_cast<size_t>(config.encoder.layers));
     for (int64_t index = 0; index < config.encoder.layers; ++index) {

@@ -166,9 +166,16 @@ Session::Session(
         {assets::TensorStorageType::Native, assets::TensorStorageType::F32,
          assets::TensorStorageType::F16, assets::TensorStorageType::BF16,
          assets::TensorStorageType::Q8_0});
+    // AUDIOCPP_NEMOTRON3_DIAR_EXTERNAL_ENCODER=1: the caller will supply encode() via
+    // set_external_encoder, so skip uploading the encoder+head weights (~100 MB it would never touch). An env
+    // var, not a session option: session options are validated against the spec JSON embedded in the GGUF,
+    // and adding one would mean rewriting every converted model file.
+    if (const char * v = std::getenv("AUDIOCPP_NEMOTRON3_DIAR_EXTERNAL_ENCODER")) {
+        external_encoder_only_ = runtime::parse_bool_option(v, "AUDIOCPP_NEMOTRON3_DIAR_EXTERNAL_ENCODER");
+    }
     weights_ = load_weights(
         *assets_, execution_context().backend(), execution_context().backend_type(),
-        storage, weight_context_bytes_);
+        storage, weight_context_bytes_, external_encoder_only_);
     assets_->model_weights->release_storage();
     stream_scheduler_ = std::make_unique<StreamScheduler>(
         assets_->feature_config, streaming_config_, assets_->model_config.encoder.subsampling_factor);
@@ -228,10 +235,14 @@ std::vector<float> Session::encode(
     const std::vector<int64_t> & valid_frames) {
     // AUDIOCPP_DIAR_COMPARE (diagnostic only): run the external encoder AND this one on the same inputs, log
     // the difference, return THIS one's result.
-    const bool compare_ext = external_encoder_ && std::getenv("AUDIOCPP_DIAR_COMPARE") != nullptr;
+    const bool compare_ext = external_encoder_ && !external_encoder_only_ && std::getenv("AUDIOCPP_DIAR_COMPARE") != nullptr;
     std::vector<float> ext_probs;
     if (compare_ext) ext_probs = external_encoder_(embeddings, batch, frames, valid_frames);
     else if (external_encoder_) return external_encoder_(embeddings, batch, frames, valid_frames);
+    if (external_encoder_only_) {
+        throw std::runtime_error(
+            "nemotron_3_diar: session created with external_encoder=true but no external encoder is set");
+    }
     const bool prof = diar_prof::on();
     const auto t0 = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     ensure_encoder_graph(

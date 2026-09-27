@@ -112,6 +112,7 @@ private:
     size_t graph_arena_bytes_ = 1024ull * 1024ull * 1024ull;
     size_t weight_context_bytes_ = 1024ull * 1024ull * 1024ull;
     ExternalEncoder external_encoder_;
+    bool external_encoder_only_ = false;   // encoder+head weights were never loaded
 };
 
 }  // namespace engine::models::nemotron_3_diar
