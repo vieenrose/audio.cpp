@@ -1,3 +1,4 @@
+#include <cmath>
 #include "engine/models/nemotron_3_diar/session.h"
 
 #include "engine/framework/core/backend.h"
@@ -225,7 +226,12 @@ std::vector<float> Session::encode(
     int64_t batch,
     int64_t frames,
     const std::vector<int64_t> & valid_frames) {
-    if (external_encoder_) return external_encoder_(embeddings, batch, frames, valid_frames);
+    // AUDIOCPP_DIAR_COMPARE (diagnostic only): run the external encoder AND this one on the same inputs, log
+    // the difference, return THIS one's result.
+    const bool compare_ext = external_encoder_ && std::getenv("AUDIOCPP_DIAR_COMPARE") != nullptr;
+    std::vector<float> ext_probs;
+    if (compare_ext) ext_probs = external_encoder_(embeddings, batch, frames, valid_frames);
+    else if (external_encoder_) return external_encoder_(embeddings, batch, frames, valid_frames);
     const bool prof = diar_prof::on();
     const auto t0 = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     ensure_encoder_graph(
@@ -404,6 +410,24 @@ std::vector<float> Session::encode(
     }
     std::vector<float> probabilities;
     core::read_tensor_f32_into(encoder_graph_->probabilities.tensor, probabilities);
+    if (compare_ext) {
+        double mx = 0.0; size_t flips = 0, worst = 0;
+        const size_t n = std::min(ext_probs.size(), probabilities.size());
+        for (size_t i = 0; i < n; ++i) {
+            const double d = std::fabs((double) ext_probs[i] - (double) probabilities[i]);
+            if (d > mx) { mx = d; worst = i; }
+            if ((ext_probs[i] > 0.5F) != (probabilities[i] > 0.5F)) ++flips;
+        }
+        if (const char * dd = std::getenv("AUDIOCPP_DIAR_COMPARE_DIR")) {
+            static int call = 0;
+            const std::string b = std::string(dd) + "/c" + std::to_string(call++);
+            if (std::FILE * f = std::fopen((b + "_own.f32").c_str(), "wb")) { std::fwrite(probabilities.data(), 4, probabilities.size(), f); std::fclose(f); }
+            if (std::FILE * f = std::fopen((b + "_ext.f32").c_str(), "wb")) { std::fwrite(ext_probs.data(), 4, ext_probs.size(), f); std::fclose(f); }
+            if (std::FILE * f = std::fopen((b + "_emb.f32").c_str(), "wb")) { std::fwrite(embeddings.data(), 4, embeddings.size(), f); std::fclose(f); }
+        }
+        std::fprintf(stderr, "DIAR_COMPARE frames=%lld valid=%lld n_own=%zu n_ext=%zu max_abs=%.6g at=%zu flips@0.5=%zu\n",
+                     (long long) frames, (long long) valid_frames[0], probabilities.size(), ext_probs.size(), mx, worst, flips);
+    }
     return probabilities;
 }
 
